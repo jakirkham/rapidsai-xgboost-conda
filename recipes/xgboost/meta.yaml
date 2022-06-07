@@ -19,6 +19,7 @@ source:
   git_tag: {{ xgboost_branch }}
   patches:
     - xgboost_master.patch
+    - PR_7977.patch
 
 build:
   number: 2

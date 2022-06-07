@@ -1,0 +1,324 @@
+From 6df83b5f4432e35104b9768cda1924d7e6d8c303 Mon Sep 17 00:00:00 2001
+From: Jiaming Yuan <jm.yuan@outlook.com>
+Date: Mon, 6 Jun 2022 20:18:32 +0800
+Subject: [PATCH] Fix rmm build (#7973)
+
+- Optionally switch to c++17
+- Use rmm CMake target.
+- Workaround compiler errors.
+- Fix GPUMetric inheritance.
+- Run death tests even if it's built with RMM support.
+
+Co-authored-by: jakirkham <jakirkham@gmail.com>
+---
+ CMakeLists.txt                |  4 +++
+ Jenkinsfile                   |  4 +--
+ cmake/Utils.cmake             | 39 ++++++++++++++++-----
+ plugin/CMakeLists.txt         | 13 -------
+ src/data/data.cu              |  4 +--
+ src/metric/metric_common.h    |  3 +-
+ src/metric/rank_metric.cu     |  2 +-
+ tests/ci_build/Dockerfile.rmm |  7 ++--
+ tests/cpp/common/test_span.cu | 65 +++++++++++++++++------------------
+ 9 files changed, 75 insertions(+), 66 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 14debdfac5c..e0ec56efd36 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -200,6 +200,10 @@ endif (JVM_BINDINGS)
+ # Plugin
+ add_subdirectory(${xgboost_SOURCE_DIR}/plugin)
+ 
++if (PLUGIN_RMM)
++  find_package(rmm REQUIRED)
++endif (PLUGIN_RMM)
++
+ #-- library
+ if (BUILD_STATIC_LIB)
+   add_library(xgboost STATIC)
+diff --git a/Jenkinsfile b/Jenkinsfile
+index 7034329215c..3ea3d9b1196 100644
+--- a/Jenkinsfile
++++ b/Jenkinsfile
+@@ -397,7 +397,7 @@ def TestCppGPU(args) {
+   node(nodeReq) {
+     unstash name: "xgboost_cpp_tests_cuda${artifact_cuda_version}"
+     unstash name: 'srcs'
+-    echo "Test C++, CUDA ${args.host_cuda_version}"
++    echo "Test C++, CUDA ${args.host_cuda_version}, rmm: ${args.test_rmm}"
+     def container_type = "gpu"
+     def docker_binary = "nvidia-docker"
+     def docker_args = "--build-arg CUDA_VERSION_ARG=${args.host_cuda_version}"
+@@ -410,7 +410,7 @@ def TestCppGPU(args) {
+       docker_binary = "nvidia-docker"
+       docker_args = "--build-arg CUDA_VERSION_ARG=${args.host_cuda_version}"
+       sh """
+-      ${dockerRun} ${container_type} ${docker_binary} ${docker_args} bash -c "source activate gpu_test && build/testxgboost --use-rmm-pool --gtest_filter=-*DeathTest.*"
++      ${dockerRun} ${container_type} ${docker_binary} ${docker_args} bash -c "source activate gpu_test && build/testxgboost --use-rmm-pool"
+       """
+     }
+     deleteDir()
+diff --git a/cmake/Utils.cmake b/cmake/Utils.cmake
+index 963c494ccf2..72de7d688f8 100644
+--- a/cmake/Utils.cmake
++++ b/cmake/Utils.cmake
+@@ -169,10 +169,17 @@ function(xgboost_set_cuda_flags target)
+       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+   endif (MSVC)
+ 
+-  set_target_properties(${target} PROPERTIES
+-    CUDA_STANDARD 14
+-    CUDA_STANDARD_REQUIRED ON
+-    CUDA_SEPARABLE_COMPILATION OFF)
++  if (PLUGIN_RMM)
++    set_target_properties(${target} PROPERTIES
++      CUDA_STANDARD 17
++      CUDA_STANDARD_REQUIRED ON
++      CUDA_SEPARABLE_COMPILATION OFF)
++  else ()
++    set_target_properties(${target} PROPERTIES
++      CUDA_STANDARD 14
++      CUDA_STANDARD_REQUIRED ON
++      CUDA_SEPARABLE_COMPILATION OFF)
++  endif (PLUGIN_RMM)
+ endfunction(xgboost_set_cuda_flags)
+ 
+ macro(xgboost_link_nccl target)
+@@ -189,10 +196,18 @@ endmacro(xgboost_link_nccl)
+ 
+ # compile options
+ macro(xgboost_target_properties target)
+-  set_target_properties(${target} PROPERTIES
+-    CXX_STANDARD 14
+-    CXX_STANDARD_REQUIRED ON
+-    POSITION_INDEPENDENT_CODE ON)
++  if (PLUGIN_RMM)
++    set_target_properties(${target} PROPERTIES
++      CXX_STANDARD 17
++      CXX_STANDARD_REQUIRED ON
++      POSITION_INDEPENDENT_CODE ON)
++  else ()
++    set_target_properties(${target} PROPERTIES
++      CXX_STANDARD 14
++      CXX_STANDARD_REQUIRED ON
++      POSITION_INDEPENDENT_CODE ON)
++  endif (PLUGIN_RMM)
++
+   if (HIDE_CXX_SYMBOLS)
+     #-- Hide all C++ symbols
+     set_target_properties(${target} PROPERTIES
+@@ -247,6 +262,10 @@ macro(xgboost_target_defs target)
+       PRIVATE
+       -DXGBOOST_BUILTIN_PREFETCH_PRESENT=1)
+   endif (XGBOOST_BUILTIN_PREFETCH_PRESENT)
++
++  if (PLUGIN_RMM)
++    target_compile_definitions(objxgboost PUBLIC -DXGBOOST_USE_RMM=1)
++  endif (PLUGIN_RMM)
+ endmacro(xgboost_target_defs)
+ 
+ # handles dependencies
+@@ -269,6 +288,10 @@ macro(xgboost_target_link_libraries target)
+     xgboost_set_cuda_flags(${target})
+   endif (USE_CUDA)
+ 
++  if (PLUGIN_RMM)
++    target_link_libraries(${target} PRIVATE rmm::rmm)
++  endif (PLUGIN_RMM)
++
+   if (USE_NCCL)
+     xgboost_link_nccl(${target})
+   endif (USE_NCCL)
+diff --git a/plugin/CMakeLists.txt b/plugin/CMakeLists.txt
+index 97d1af190cf..2fdcc820699 100644
+--- a/plugin/CMakeLists.txt
++++ b/plugin/CMakeLists.txt
+@@ -2,19 +2,6 @@ if (PLUGIN_DENSE_PARSER)
+   target_sources(objxgboost PRIVATE ${xgboost_SOURCE_DIR}/plugin/dense_parser/dense_libsvm.cc)
+ endif (PLUGIN_DENSE_PARSER)
+ 
+-if (PLUGIN_RMM)
+-  find_path(RMM_INCLUDE "rmm" HINTS "$ENV{RMM_ROOT}/include")
+-  if (NOT RMM_INCLUDE)
+-    message(FATAL_ERROR "Could not locate RMM library")
+-  endif ()
+-
+-  message(STATUS "RMM: RMM_LIBRARY set to ${RMM_LIBRARY}")
+-  message(STATUS "RMM: RMM_INCLUDE set to ${RMM_INCLUDE}")
+-
+-  target_include_directories(objxgboost PUBLIC ${RMM_INCLUDE})
+-  target_compile_definitions(objxgboost PUBLIC -DXGBOOST_USE_RMM=1)
+-endif (PLUGIN_RMM)
+-
+ if (PLUGIN_UPDATER_ONEAPI)
+   add_library(oneapi_plugin OBJECT
+     ${xgboost_SOURCE_DIR}/plugin/updater_oneapi/regression_obj_oneapi.cc
+diff --git a/src/data/data.cu b/src/data/data.cu
+index cf574dd50f1..e983f75dc76 100644
+--- a/src/data/data.cu
++++ b/src/data/data.cu
+@@ -130,12 +130,12 @@ void MetaInfo::SetInfoFromCUDA(Context const&, StringView key, Json array) {
+   }
+   // uint info
+   if (key == "group") {
+-    auto array_interface{ArrayInterface<1>(array)};
++    ArrayInterface<1> array_interface{array};
+     CopyGroupInfoImpl(array_interface, &group_ptr_);
+     data::ValidateQueryGroup(group_ptr_);
+     return;
+   } else if (key == "qid") {
+-    auto array_interface{ArrayInterface<1>(array)};
++    ArrayInterface<1> array_interface{array};
+     CopyQidImpl(array_interface, &group_ptr_);
+     data::ValidateQueryGroup(group_ptr_);
+     return;
+diff --git a/src/metric/metric_common.h b/src/metric/metric_common.h
+index d676797f487..b1da2c59dc9 100644
+--- a/src/metric/metric_common.h
++++ b/src/metric/metric_common.h
+@@ -1,5 +1,5 @@
+ /*!
+- * Copyright 2018-2020 by Contributors
++ * Copyright 2018-2022 by Contributors
+  * \file metric_common.h
+  */
+ #ifndef XGBOOST_METRIC_METRIC_COMMON_H_
+@@ -9,6 +9,7 @@
+ #include <string>
+ 
+ #include "../common/common.h"
++#include "xgboost/metric.h"
+ 
+ namespace xgboost {
+ 
+diff --git a/src/metric/rank_metric.cu b/src/metric/rank_metric.cu
+index 36fca9482a9..c26d3dea925 100644
+--- a/src/metric/rank_metric.cu
++++ b/src/metric/rank_metric.cu
+@@ -27,7 +27,7 @@ DMLC_REGISTRY_FILE_TAG(rank_metric_gpu);
+ 
+ /*! \brief Evaluate rank list on GPU */
+ template <typename EvalMetricT>
+-struct EvalRankGpu : public Metric, public EvalRankConfig {
++struct EvalRankGpu : public GPUMetric, public EvalRankConfig {
+  public:
+   double Eval(const HostDeviceVector<bst_float> &preds, const MetaInfo &info,
+               bool distributed) override {
+diff --git a/tests/ci_build/Dockerfile.rmm b/tests/ci_build/Dockerfile.rmm
+index 3d4906d4a25..b78028a9b2d 100644
+--- a/tests/ci_build/Dockerfile.rmm
++++ b/tests/ci_build/Dockerfile.rmm
+@@ -12,10 +12,7 @@ RUN \
+     apt-get install -y wget unzip bzip2 libgomp1 build-essential ninja-build git && \
+     # Python
+     wget -O Miniconda3.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh && \
+-    bash Miniconda3.sh -b -p /opt/python && \
+-    # CMake
+-    wget -nv -nc https://cmake.org/files/v3.14/cmake-3.14.0-Linux-x86_64.sh --no-check-certificate && \
+-    bash cmake-3.14.0-Linux-x86_64.sh --skip-license --prefix=/usr
++    bash Miniconda3.sh -b -p /opt/python
+ 
+ # NCCL2 (License: https://docs.nvidia.com/deeplearning/sdk/nccl-sla/index.html)
+ RUN \
+@@ -29,7 +26,7 @@ ENV PATH=/opt/python/bin:$PATH
+ # Create new Conda environment with RMM
+ RUN \
+     conda create -n gpu_test -c rapidsai-nightly -c rapidsai -c nvidia -c conda-forge -c defaults \
+-        python=3.8 rmm=21.10* cudatoolkit=$CUDA_VERSION_ARG
++        python=3.9 rmm=22.06* cudatoolkit=$CUDA_VERSION_ARG cmake
+ 
+ ENV GOSU_VERSION 1.10
+ 
+diff --git a/tests/cpp/common/test_span.cu b/tests/cpp/common/test_span.cu
+index 539a9beb183..85c95234065 100644
+--- a/tests/cpp/common/test_span.cu
++++ b/tests/cpp/common/test_span.cu
+@@ -252,7 +252,7 @@ __global__ void TestLastStaticKernel(Span<float> _span) {
+   _span.last(static_cast<Span<float>::index_type>(-1));
+ }
+ 
+-TEST(GPUSpan, FirstLast) {
++TEST(GPUSpanDeathTest, FirstLast) {
+   // We construct vectors multiple times since thrust can not recover from
+   // death test.
+   auto lambda_first_dy = []() {
+@@ -312,40 +312,37 @@ TEST(GPUSpan, FirstLast) {
+   output = testing::internal::GetCapturedStdout();
+ }
+ 
+-__global__ void TestFrontKernel(Span<float> _span)  {
+-  _span.front();
+-}
+-
+-__global__ void TestBackKernel(Span<float> _span)  {
+-  _span.back();
++namespace {
++void TestFrontBack() {
++  Span<float> s;
++  EXPECT_DEATH(
++      {
++        // make sure the termination happens inside this test.
++        try {
++          dh::LaunchN(1, [=] __device__(size_t) { s.front(); });
++          dh::safe_cuda(cudaDeviceSynchronize());
++          dh::safe_cuda(cudaGetLastError());
++        } catch (dmlc::Error const& e) {
++          std::terminate();
++        }
++      },
++      "");
++  EXPECT_DEATH(
++      {
++        try {
++          dh::LaunchN(1, [=] __device__(size_t) { s.back(); });
++          dh::safe_cuda(cudaDeviceSynchronize());
++          dh::safe_cuda(cudaGetLastError());
++        } catch (dmlc::Error const& e) {
++          std::terminate();
++        }
++      },
++      "");
+ }
++}  // namespace
+ 
+-TEST(GPUSpan, FrontBack) {
+-  dh::safe_cuda(cudaSetDevice(0));
+-
+-  Span<float> s;
+-  auto lambda_test_front = [=]() {
+-    // make sure the termination happens inside this test.
+-    try {
+-      TestFrontKernel<<<1, 1>>>(s);
+-      dh::safe_cuda(cudaDeviceSynchronize());
+-      dh::safe_cuda(cudaGetLastError());
+-    } catch (dmlc::Error const& e) {
+-      std::terminate();
+-    }
+-  };
+-  EXPECT_DEATH(lambda_test_front(), "");
+-
+-  auto lambda_test_back = [=]() {
+-    try {
+-      TestBackKernel<<<1, 1>>>(s);
+-      dh::safe_cuda(cudaDeviceSynchronize());
+-      dh::safe_cuda(cudaGetLastError());
+-    } catch (dmlc::Error const& e) {
+-      std::terminate();
+-    }
+-  };
+-  EXPECT_DEATH(lambda_test_back(), "");
++TEST(GPUSpanDeathTest, FrontBack) {
++  TestFrontBack();
+ }
+ 
+ __global__ void TestSubspanDynamicKernel(Span<float> _span) {
+@@ -354,7 +351,7 @@ __global__ void TestSubspanDynamicKernel(Span<float> _span) {
+ __global__ void TestSubspanStaticKernel(Span<float> _span) {
+   _span.subspan<16>();
+ }
+-TEST(GPUSpan, Subspan) {
++TEST(GPUSpanDeathTest, Subspan) {
+   auto lambda_subspan_dynamic = []() {
+     thrust::host_vector<float> h_vec (4);
+     InitializeRange(h_vec.begin(), h_vec.end());
