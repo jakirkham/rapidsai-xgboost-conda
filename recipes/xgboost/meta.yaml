@@ -38,7 +38,7 @@ requirements:
   build:
     - {{ compiler('c') }}
     - {{ compiler('cxx') }}
-    - {{ compiler('cuda') }} {{ cuda_version }}.*         # [xgboost_proc_type == "gpu"]
+    - {{ compiler('cuda') }}  # [xgboost_proc_type == "gpu"]
     - git
     - cmake
     - make
